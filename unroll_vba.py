@@ -17,13 +17,6 @@ class UnrollVBA(nn.Module):
         self.scale = scale
         shared_r = rModule(scale)
         shared_unet = UNet(in_channels=3, out_channels=1)
-        # shared_unet = smp.Unet(
-        #     encoder_name="resnet18",  # 轻量可选: resnet18 / resnet34 / efficientnet-b0 等
-        #     encoder_weights=None,  # 不用预训练权重（红外任务非自然图像）
-        #     # encoder_depth=3,
-        #     in_channels=3,
-        #     classes=1
-        # )
         shared_resrefine = ResNetRefine(in_channels=3)
         # self.model = nn.ModuleList([IterBlock(self.scale) for _ in range(block_num)])
         self.model = nn.ModuleList([
@@ -68,8 +61,8 @@ class rModule(nn.Module):
 
     def __init__(self, scale):
         super(rModule, self).__init__()
-        self.gamma_n = nn.Parameter(torch.Tensor([1e-4]))  # 更小的初始值
-        self.gamma_p = nn.Parameter(torch.Tensor([1e-4]))
+        self.gamma_n = nn.Parameter(torch.Tensor([1e-5]))  # 更小的初始值
+        self.gamma_p = nn.Parameter(torch.Tensor([1e-5]))
         # self.gamma_n = nn.Parameter(torch.Tensor(1))
         # self.gamma_p = nn.Parameter(torch.Tensor(1))
         self.scale = scale
@@ -170,75 +163,92 @@ class lambdaModule(nn.Module):
         lambdak = torch.pow(Dhx(mk), 2) + torch.pow(Dvx(mk), 2) + traceDhtDhSigmak + traceDvtDvSigmak
         return lambdak
 
-
-class DoubleConv(nn.Module):
-    """UNet 双卷积模块"""
-
-    def __init__(self, in_ch, out_ch):
-        super(DoubleConv, self).__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
-            # nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1),
-            # nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True)
-        )
-
-    def forward(self, x):
-        return self.conv(x)
-
-
 class UNet(nn.Module):
     def __init__(self, in_channels=3, out_channels=1):
         super(UNet, self).__init__()
-
-        # 编码器（下采样部分）
-        self.inc = DoubleConv(in_channels, 64)
-        self.down1 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(64, 128))
-        self.down2 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(128, 256))
-        self.down3 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(256, 512))
-
-        # 解码器（上采样部分）
-        self.up1 = nn.ConvTranspose2d(512, 256, kernel_size=2, stride=2)
-        self.conv_up1 = DoubleConv(512, 256)
-
-        self.up2 = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)
-        self.conv_up2 = DoubleConv(256, 128)
-
-        self.up3 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
-        self.conv_up3 = DoubleConv(128, 64)
-
-        # 输出层
-        self.outc = nn.Conv2d(64, out_channels, kernel_size=1)
+        self.model = smp.Unet(
+            encoder_name="resnet18",
+            encoder_weights=None,
+            in_channels=in_channels,
+            classes=out_channels,
+            activation=None,  # 不使用默认激活，后续手动添加
+        )
         self.softplus = nn.Softplus()
-        self.relu = nn.ReLU()
-
 
     def forward(self, mk1_invSig1, mk_invSig, mr_invSig_r):
-        # 编码路径
         x = torch.cat([mk1_invSig1, mk_invSig, mr_invSig_r], dim=1)
-        x1 = self.inc(x)
-        x2 = self.down1(x1)
-        x3 = self.down2(x2)
-        x4 = self.down3(x3)
-        # 解码路径
-        x = self.up1(x4)
-        x = torch.cat([x, x3], dim=1)
-        x = self.conv_up1(x)
-
-        x = self.up2(x)
-        x = torch.cat([x, x2], dim=1)
-        x = self.conv_up2(x)
-
-        x = self.up3(x)
-        x = torch.cat([x, x1], dim=1)
-        x = self.conv_up3(x)
-
-        out = self.outc(x)
+        out = self.model(x)
         out = self.softplus(out)
-        # out = self.relu(out)
         return out
+
+# class DoubleConv(nn.Module):
+#     """UNet 双卷积模块"""
+#
+#     def __init__(self, in_ch, out_ch):
+#         super(DoubleConv, self).__init__()
+#         self.conv = nn.Sequential(
+#             nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
+#             # nn.BatchNorm2d(out_ch),
+#             nn.ReLU(inplace=True),
+#             nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1),
+#             # nn.BatchNorm2d(out_ch),
+#             nn.ReLU(inplace=True)
+#         )
+#
+#     def forward(self, x):
+#         return self.conv(x)
+
+
+# class UNet(nn.Module):
+#     def __init__(self, in_channels=3, out_channels=1):
+#         super(UNet, self).__init__()
+#
+#         # 编码器（下采样部分）
+#         self.inc = DoubleConv(in_channels, 64)
+#         self.down1 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(64, 128))
+#         self.down2 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(128, 256))
+#         self.down3 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(256, 512))
+#
+#         # 解码器（上采样部分）
+#         self.up1 = nn.ConvTranspose2d(512, 256, kernel_size=2, stride=2)
+#         self.conv_up1 = DoubleConv(512, 256)
+#
+#         self.up2 = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)
+#         self.conv_up2 = DoubleConv(256, 128)
+#
+#         self.up3 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
+#         self.conv_up3 = DoubleConv(128, 64)
+#
+#         # 输出层
+#         self.outc = nn.Conv2d(64, out_channels, kernel_size=1)
+#         self.softplus = nn.Softplus()
+#         self.relu = nn.ReLU()
+#
+#
+#     def forward(self, mk1_invSig1, mk_invSig, mr_invSig_r):
+#         # 编码路径
+#         x = torch.cat([mk1_invSig1, mk_invSig, mr_invSig_r], dim=1)
+#         x1 = self.inc(x)
+#         x2 = self.down1(x1)
+#         x3 = self.down2(x2)
+#         x4 = self.down3(x3)
+#         # 解码路径
+#         x = self.up1(x4)
+#         x = torch.cat([x, x3], dim=1)
+#         x = self.conv_up1(x)
+#
+#         x = self.up2(x)
+#         x = torch.cat([x, x2], dim=1)
+#         x = self.conv_up2(x)
+#
+#         x = self.up3(x)
+#         x = torch.cat([x, x1], dim=1)
+#         x = self.conv_up3(x)
+#
+#         out = self.outc(x)
+#         out = self.softplus(out)
+#         # out = self.relu(out)
+#         return out
 
 
 
@@ -284,40 +294,59 @@ class ResBlock(nn.Module):
             return x + out * self.res_scale
 
 # ResNetRefine：输入3通道 → 输出1通道
+# class ResNetRefine(nn.Module):
+#     def __init__(self, in_channels=3, base_ch=64, num_blocks=8, use_ca=True, res_scale=0.2, use_bn=False):
+#         super().__init__()
+#         self.use_ca = use_ca
+#         # 输入层
+#         self.conv_in = nn.Conv2d(in_channels, base_ch, kernel_size=3, padding=1, bias=True)
+#         # 残差体
+#         self.blocks = nn.ModuleList([
+#             ResBlock(base_ch, kernel_size=3, use_bn=use_bn, use_ca=use_ca, res_scale=res_scale)
+#             for _ in range(num_blocks)
+#         ])
+#         self.conv_out = nn.Conv2d(base_ch, 1, kernel_size=3, padding=1, bias=True)
+#         self.sigmoid = nn.Sigmoid()
+#         self.relu = nn.ReLU()
+#         self.elu = nn.ELU(alpha=-1)
+#         self.softplus = nn.Softplus(beta=1.0)
+#         self.lr = nn.LeakyReLU(negative_slope=0.2)
+#     def forward(self, x):
+#         """
+#         x: [B, 3, H, W]
+#         return: newinvSigmak > 0
+#         """
+#         x = self.conv_in(x)
+#         identity = x
+#         for blk in self.blocks:
+#             x = blk(x)
+#         x = x + identity  # 残差连接
+#         x = self.conv_out(x)
+#         # x = self.relu(x) + 1e-3
+#         # x = self.sigmoid(x) * 10 + 1e-3
+#         x = self.elu(x) + 1e-6
+#         # x = self.lr(x) + 1e-6
+#         # x = self.softplus(x) + 1e-6
+#         return x
+# ResNetRefine 仅输出 Δ（不做激活），通道仍然1
 class ResNetRefine(nn.Module):
-    def __init__(self, in_channels=3, base_ch=64, num_blocks=8, use_ca=True, res_scale=0.2, use_bn=False):
+    def __init__(self, in_channels=3, base_ch=64, num_blocks=8, use_ca=True, res_scale=0.2, use_bn=False, alpha_max=0.2):
         super().__init__()
-        self.use_ca = use_ca
-        # 输入层
-        self.conv_in = nn.Conv2d(in_channels, base_ch, kernel_size=3, padding=1, bias=True)
-        # 残差体
-        self.blocks = nn.ModuleList([
-            ResBlock(base_ch, kernel_size=3, use_bn=use_bn, use_ca=use_ca, res_scale=res_scale)
-            for _ in range(num_blocks)
-        ])
-        self.conv_out = nn.Conv2d(base_ch, 1, kernel_size=3, padding=1, bias=True)
-        self.sigmoid = nn.Sigmoid()
-        self.relu = nn.ReLU()
-        self.elu = nn.ELU(alpha=-1)
-        self.softplus = nn.Softplus(beta=1.0)
-        self.lr = nn.LeakyReLU(negative_slope=0.2)
-    def forward(self, x):
-        """
-        x: [B, 3, H, W]
-        return: newinvSigmak > 0
-        """
-        x = self.conv_in(x)
-        identity = x
+        self.alpha = nn.Parameter(torch.tensor(0.0))  # 学习步长的“logit”
+        self.alpha_max = alpha_max                   # 每步最大相对变化幅度
+        self.conv_in = nn.Conv2d(in_channels, base_ch, 3, padding=1)
+        self.blocks = nn.ModuleList([ResBlock(base_ch, use_bn=use_bn, use_ca=use_ca, res_scale=res_scale)
+                                     for _ in range(num_blocks)])
+        self.conv_out = nn.Conv2d(base_ch, 1, 3, padding=1)
+
+    def forward(self, x):  # x 仍是 concat(invSigmak, invSigmak_1, invSigma_r) or log域输入，见下B
+        h = self.conv_in(x)
         for blk in self.blocks:
-            x = blk(x)
-        x = x + identity  # 残差连接
-        x = self.conv_out(x)
-        # x = self.relu(x) + 1e-3
-        # x = self.sigmoid(x) * 10 + 1e-3
-        x = self.elu(x) + 1e-6
-        # x = self.lr(x) + 1e-6
-        # x = self.softplus(x) + 1e-6
-        return x
+            h = blk(h)
+        delta = self.conv_out(h)  # 无激活，R
+        # 把标量步长限制在 (0, alpha_max)
+        step = self.alpha_max * torch.sigmoid(self.alpha)
+        return delta, step
 
 
 """### iteration block"""
@@ -378,7 +407,17 @@ class IterBlock(nn.Module):
         # newmk_mul_newinvSigmak = nn.Softplus()(newmk_mul_newinvSigmak)
         print("newmk_mul_newinvSigmak min/max:", newmk_mul_newinvSigmak.min().item(), newmk_mul_newinvSigmak.max().item())
         net_input = torch.cat([invSigmak, invSigmak_1, invSigma_r], dim=1)
-        newinvSigmak = self.block3(net_input)
+        # net_input = torch.cat([
+        #     torch.log(invSigmak),
+        #     torch.log(invSigmak_1),
+        #     torch.log(invSigma_r)
+        # ], dim=1)
+        delta, step = self.block3(net_input)  # delta: [B,1,H,W]
+        # 以 invSigmak 为“基准”，做相对更新（保证正且步长可控）
+        newinvSigmak = invSigmak * torch.exp(step * torch.tanh(delta))
+        newinvSigmak = newinvSigmak.clamp_min(1e-6)
+        # net_input = torch.cat([invSigmak, invSigmak_1, invSigma_r], dim=1)
+        # newinvSigmak = self.block3(net_input)
         # print('newinvSigmak_shape:', newinvSigmak.shape)
         newmk = newmk_mul_newinvSigmak/newinvSigmak
         print("invSigmak min/max:", newinvSigmak.min().item(), newinvSigmak.max().item(), newinvSigmak.mean().item())
