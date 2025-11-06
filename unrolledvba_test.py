@@ -21,7 +21,7 @@ Use a method works for you
 ########################################################
 
 
-from tqdm import tqdm
+
 from unroll_vba import *
 import numpy as np
 import torch
@@ -40,7 +40,12 @@ import scipy.sparse
 from dataset import SRDataset
 from operators import *
 import signal
+from tqdm import tqdm
 from skimage.metrics import structural_similarity as ssim_metric
+torch.backends.cudnn.benchmark = False # 关闭自动优化（减少显存波动）
+# # 启用内存池管理，优化小张量分配
+# torch.cuda.set_per_process_memory_fraction(0.9)  # 限制进程使用90%显存，留缓冲
+torch.cuda.empty_cache()  # 初始化前清空缓存
 
 def compute_psnr(img1, img2):
     """计算两张 [0,1] 张量的 PSNR"""
@@ -48,7 +53,7 @@ def compute_psnr(img1, img2):
     psnr = 10 * torch.log10(1.0 / mse)
     return psnr.item()
 
-hr_folder = r"D:\data\SR\DIV2K\DIV2K_train_HR_gray"
+hr_folder = r"C:\Users\vipuser\Desktop\DIV2K_train_HR_gray\DIV2K_train_HR_gray"
 dataset = SRDataset(hr_folder, patch_size=256, scale=4, noise_std=0.01, augment=True)
 #dataset = dataset[0]
 #print(dataset['x'].shape, dataset['y'].shape, dataset['Aty'].shape)
@@ -131,12 +136,22 @@ class Trainer(object):
             raise NotImplementedError("Unsupported model: {}".format(self.model))
         return model
 
+    # def count_params(self, module, prefix=""):
+    #     """递归统计模块及其子模块的参数数量"""
+    #     total = 0
+    #     # 遍历模型的子模块（必须传入模型实例，才能调用 named_children()）
+    #     for name, child in module.named_children():
+    #         child_params = sum(p.numel() for p in child.parameters() if p.requires_grad)
+    #         total += child_params
+    #         print(f"{prefix}{name}: {child_params:,}")
+    #     print(f"{prefix}Total: {total:,}\n")
+    #     return total
+
 
     def _get_dataset(self):
         if self.dataset == 'infrared':
-            # hr_folder = r"D:\data\SR\DIV2K\DIV2K_train_HR_gray"
-            hr_folder = r"D:\data\SR\train\M3FD\Infrared"
-            dataset = SRDataset(hr_folder, patch_size=256, scale=4, noise_std=0.01, augment=True,limit=60)
+            hr_folder = r"C:\Users\vipuser\Desktop\DIV2K_train_HR_gray\DIV2K_train_HR_gray"
+            dataset = SRDataset(hr_folder, patch_size=256, scale=4, noise_std=0.01, augment=True,limit=600)
             # dataset = SRDataset(hr_folder, patch_size=256, scale=4, noise_std=0.01, augment=True)
         else:
             raise NotImplementedError("Unsupported dataset: {}".format(self.dataset))
@@ -159,7 +174,7 @@ class Trainer(object):
         elif self.optimizer == 'sgd':
             optimizer = torch.optim.SGD(model.parameters(), lr=self.lr, momentum=0.9)
         elif self.optimizer == 'adamW':
-            optimizer = torch.optim.AdamW(model.parameters(), lr=self.lr)
+            optimizer = torch.optim.AdamW(model.parameters(), lr=self.lr, weight_decay=1e-4)
         else:
             raise NotImplementedError("Unsupported optimizer: {}".format(self.optimizer))
 
@@ -169,19 +184,16 @@ class Trainer(object):
     def _save_reconstructed_image(self, recon, x_true,y, epoch, iter_num):
         """保存重构图像和真实图像"""
         # 确保图像在CPU上且为numpy格式，只取batch中的第一张图像
-        recon_tensor = recon[7].detach().cpu()  # 获取张量
-        recon = recon_tensor.squeeze().numpy()
-        # recon_tensor_clamped = torch.clamp(recon_tensor, 0.0, 1.0)
-        # recon = recon_tensor_clamped.squeeze().numpy()  # 转为numpy
-        x_true = x_true[7].detach().cpu().squeeze().numpy()
-        y = y[7].detach().cpu().squeeze().numpy()
+        recon = recon[3].detach().cpu().squeeze().numpy()
+        x_true = x_true[3].detach().cpu().squeeze().numpy()
+        y = y[3].detach().cpu().squeeze().numpy()
 
         recon = (recon * 255).astype(np.uint8)
         x_true = (x_true * 255).astype(np.uint8)
         y = (y * 255).astype(np.uint8)
 
         # 创建图像保存路径
-        save_path = os.path.join(self.img_save_dir, 'train2', f"epoch_{epoch}_iter_{iter_num}")
+        save_path = os.path.join(self.img_save_dir, 'train3', f"epoch_{epoch}_iter_{iter_num}")
         os.makedirs(save_path, exist_ok=True)
 
         # 绘制并保存重构图像
@@ -220,14 +232,16 @@ class Trainer(object):
         plt.close()
 
     def training(self, writer):
+
         dataset = self._get_dataset()
         print("Load dataset...")
         test_loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
         loss_func = self._get_loss_func()
         model = self._get_model()
-
+        # print("参数分布：")
+        # self.count_params(model)
         optimizer = self._get_optimizer(model)
-        # best_val_score = 0
+        best_val_score = 0
         # early_stopper = EarlyStopping(patience=5)
 
         print("Start training...")
@@ -256,7 +270,7 @@ class Trainer(object):
             plt.grid(True)
 
             plt.tight_layout()
-            plt.savefig(os.path.join(self.img_save_dir, 'train2', f"progress_until_epoch_{len(losses)}.png"))
+            plt.savefig(os.path.join(self.img_save_dir, 'train3', f"progress_until_epoch_{len(losses)}.png"))
             plt.close()
             print(f"[INFO] 保存至 epoch {len(losses)} 的曲线 progress_until_epoch_{len(losses)}.png")
 
@@ -270,10 +284,11 @@ class Trainer(object):
         for epoch in range(self.epochs):
             model.train()
             train_loss = 0
+            train_correct = 0
             epoch_psnr, epoch_ssim = 0, 0
             count = 0
-            # best_model_psnr = -1
-            # best_model_path = os.path.join('results', "best_model.pth")
+            best_model_psnr = -1
+            best_model_path = os.path.join('results', "best_model.pth")
             best_psnr_in_epoch = -1
             best_recon = None
             best_x_true = None
@@ -283,12 +298,14 @@ class Trainer(object):
             # for iter_num, data in enumerate(test_loader):
             loop = tqdm(enumerate(test_loader), total=len(test_loader), desc=f"Epoch {epoch + 1}/{self.epochs}")
             for iter_num, data in loop:
-                # dataset returns a tuple (x, y, Aty)
+            # dataset returns a tuple (x, y, Aty)
                 x_true, y, Aty = data
                 x_true = x_true.to(self.device)
                 y = y.to(self.device)
                 Aty = Aty.to(self.device)
                 mk_0 = F.interpolate(y, scale_factor=4, mode='bicubic', align_corners=False)
+                # mk_0 = Aty
+                # print('mk_0:', mk_0.min().item(), mk_0.max().item(), mk_0.mean().item())
                 mk = mk_0
                 mk_1 = mk_0
                 invSigmak_1, invSigmak, lambdak = self.initialization(Aty)
@@ -299,6 +316,7 @@ class Trainer(object):
                 # print("diagAtA:", diagAtA.min(), diagAtA.max(), diagAtA.mean().item())
                 output = model(Aty, diagAtA, mk_1, invSigmak_1, mk, invSigmak, lambdak)
                 recon = output[2]
+
 
                 for i in range(recon.shape[0]):
                     recon_t = recon[i, 0].detach()
@@ -312,6 +330,7 @@ class Trainer(object):
                     epoch_psnr += psnr_val
                     epoch_ssim += ssim_val
                     count += 1
+
                     # 更新 epoch 内最优 PSNR
                     if psnr_val > best_psnr_in_epoch:
                         best_psnr_in_epoch = psnr_val
@@ -321,10 +340,10 @@ class Trainer(object):
                         best_Aty = Aty[i:i + 1].clone()
                         best_ssim_val = ssim_val
                     # 输出batch中所有样本的结果
-                    print(f"Batch {iter_num} | "
-                          f"PSNR(Aty)={psnr_Aty:.2f}  | "
-                          f"PSNR(Recon)={psnr_val:.2f}   |"
-                          f"SSIM(Recon)={ssim_val:.2f}")
+                    # print(f"Batch {iter_num} | "
+                    #       f"PSNR(Aty)={psnr_Aty:.2f}  | "
+                    #       f"PSNR(Recon)={psnr_val:.2f}   |"
+                    #       f"SSIM(Recon)={ssim_val:.2f}")
                 # print(f"[DEBUG] recon range: {recon.min():.6f} ~ {recon.max():.6f}")
                 # 保存batch中最后一个样本的recon
                 if iter_num == 0:
@@ -333,12 +352,14 @@ class Trainer(object):
                 loss = loss_func(output[2], x_true)
                 # print('\n Loss Epoch {} : {:.4f}\n'.format(epoch, loss))
                 train_loss += loss.item()
+                # 在进度条右侧显示当前batch最后一个样本的关键指标（动态更新）
                 loop.set_postfix({
                     "Loss": f"{loss.item():.4f}",
                     "Last PSNR": f"{psnr_val:.2f}dB",
                     "Last SSIM": f"{ssim_val:.4f}"
                 })
                 loss.backward()
+                # print(invSigmak.grad is None)
                 total_grad_norm = 0
 
                 if iter_num % self.log_interval == 0:
@@ -359,37 +380,37 @@ class Trainer(object):
             ssims.append(avg_ssim)
             # print('\nTraining Performance Epoch {}: Average loss: {:.4f}\n'.format(
             #     epoch, train_loss / len(test_loader)))
-            print(f'Epoch {epoch}: Loss={avg_loss:.4f}, PSNR={avg_psnr:.2f}, SSIM={avg_ssim:.4f}\n')
+            print(f'Epoch {epoch+1}: Loss={avg_loss:.4f}, PSNR={avg_psnr:.2f}, SSIM={avg_ssim:.4f}\n')
 
             # === 保存当前epoch最优样本图像 ===
-            if best_recon is not None:
-                recon_img = (best_recon.detach().cpu().squeeze().numpy() * 255).astype(np.uint8)
-                y_img = (best_y.detach().cpu().squeeze().numpy() * 255).astype(np.uint8)
-                gt_img = (best_x_true.detach().cpu().squeeze().numpy() * 255).astype(np.uint8)
-                psnr_Aty = compute_psnr(best_Aty, best_x_true)
-
-                save_path = os.path.join(self.img_save_dir, 'train2', f"best_epoch_{epoch}")
-                os.makedirs(save_path, exist_ok=True)
-
-                plt.figure(figsize=(12, 4))
-                plt.subplot(1, 3, 1)
-                plt.imshow(gt_img, cmap='gray')
-                plt.title('GT')
-                plt.axis('off')
-
-                plt.subplot(1, 3, 2)
-                plt.imshow(y_img, cmap='gray')
-                plt.title(f"Aty\nPSNR={psnr_Aty:.2f}dB")
-                plt.axis('off')
-
-                plt.subplot(1, 3, 3)
-                plt.imshow(recon_img, cmap='gray')
-                plt.title(f"Best Recon\nPSNR={best_psnr_in_epoch:.2f}dB SSIM={best_ssim_val:.4f}")
-                plt.axis('off')
-
-                plt.tight_layout()
-                plt.savefig(os.path.join(save_path, 'best_recon.png'))
-                plt.close()
+            # if best_recon is not None:
+            #     recon_img = (best_recon.detach().cpu().squeeze().numpy() * 255).astype(np.uint8)
+            #     y_img = (best_y.detach().cpu().squeeze().numpy() * 255).astype(np.uint8)
+            #     gt_img = (best_x_true.detach().cpu().squeeze().numpy() * 255).astype(np.uint8)
+            #     psnr_Aty = compute_psnr(best_Aty, best_x_true)
+            #
+            #     save_path = os.path.join(self.img_save_dir, 'train3', f"best_epoch_{epoch}")
+            #     os.makedirs(save_path, exist_ok=True)
+            #
+            #     plt.figure(figsize=(12, 4))
+            #     plt.subplot(1, 3, 1)
+            #     plt.imshow(gt_img, cmap='gray')
+            #     plt.title('GT')
+            #     plt.axis('off')
+            #
+            #     plt.subplot(1, 3, 2)
+            #     plt.imshow(y_img, cmap='gray')
+            #     plt.title(f"Aty\nPSNR={psnr_Aty:.2f}dB")
+            #     plt.axis('off')
+            #
+            #     plt.subplot(1, 3, 3)
+            #     plt.imshow(recon_img, cmap='gray')
+            #     plt.title(f"Best Recon\nPSNR={best_psnr_in_epoch:.2f}dB SSIM={best_ssim_val:.4f}")
+            #     plt.axis('off')
+            #
+            #     plt.tight_layout()
+            #     plt.savefig(os.path.join(save_path, 'best_recon.png'))
+            #     plt.close()
 
         plot_progress()
         epochs = range(1, self.epochs + 1)
@@ -466,6 +487,8 @@ class Trainer(object):
     def initialization(self, mk_0):
         invSigmak_1 = 100 * torch.ones(mk_0.shape).to(self.device)
         invSigmak = 100 * torch.ones(mk_0.shape).to(self.device)
+        # invSigmak_1 = 10 * torch.ones(mk_0.shape).to(self.device)
+        # invSigmak = 10 * torch.ones(mk_0.shape).to(self.device)
 
 
         # operators
@@ -482,8 +505,8 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     args= Args(device=device, moddir="./models", outdir='./outputs',
                 logdir='./logs', imgdir='./images', resdir='./results', initdir='./inits',
-                num_classes=2, model='UnrollVBA', lr=0.001, optimizer='adam',
-                dataset='infrared', batch_size=8, epochs=10, train_size=1.0,
+                num_classes=4, model='UnrollVBA', lr=0.001, optimizer='adam',
+                dataset='infrared', batch_size=4, epochs=80, train_size=1.0,
                 num_workers=2, loss='mse', log_interval=8)
     # args = get_arguments()
     # 数据集路径
