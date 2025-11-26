@@ -20,41 +20,94 @@ Use a method works for you
 
 ########################################################
 
-
-
+from torch.utils.checkpoint import checkpoint
+from tqdm import tqdm
 from unroll_vba import *
-import numpy as np
-import torch
+import glob
 import os
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from torch import nn
-import torch.optim as optim
 from config import Args
-from PIL import Image
-from torchvision import transforms
-from autoencoder import Autoencoder
+import random
+# from autoencoder import Autoencoder
 import matplotlib.pyplot as plt
 from skimage.metrics import peak_signal_noise_ratio, structural_similarity
-import scipy.sparse
 from dataset import SRDataset
 from operators import *
 import signal
-from tqdm import tqdm
+from torchvision.models import vgg19
 from skimage.metrics import structural_similarity as ssim_metric
-torch.backends.cudnn.benchmark = False # 关闭自动优化（减少显存波动）
-# # 启用内存池管理，优化小张量分配
-# torch.cuda.set_per_process_memory_fraction(0.9)  # 限制进程使用90%显存，留缓冲
-torch.cuda.empty_cache()  # 初始化前清空缓存
+
+class TruncatedVGG19_UpToRelu34(nn.Module):
+    """
+    仅保留 VGG19 的前 8 个卷积（到 relu3_4），
+    用于快速计算感知特征；参数冻结、eval 模式。
+    支持 1ch/3ch 输入；1ch 会复制成 3ch 并做 ImageNet 归一化。
+    """
+    LAYER_NAME_BY_IDX = {
+        3: "relu1_2",
+        8: "relu2_2",
+        17: "relu3_4",
+    }
+
+    def __init__(self, return_layers=("relu1_2", "relu2_2", "relu3_4")):
+        super().__init__()
+        base = vgg19(pretrained=True).features
+        # 0..17 含：conv1_1, relu1_1, conv1_2, relu1_2, pool1,
+        #          conv2_1, relu2_1, conv2_2, relu2_2, pool2,
+        #          conv3_1, relu3_1, conv3_2, relu3_2, conv3_3, relu3_3, conv3_4, relu3_4
+        self.trunk = base[:18].eval()
+        for p in self.trunk.parameters():
+            p.requires_grad = False
+
+        # 记录需要返回的层（用 idx 对应）
+        name2idx = {v: k for k, v in self.LAYER_NAME_BY_IDX.items()}
+        self.return_indices = sorted([name2idx[n] for n in return_layers])
+
+        # ImageNet 归一化参数
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(1,3,1,1)
+        std  = torch.tensor([0.229, 0.224, 0.225]).view(1,3,1,1)
+        self.register_buffer("mean", mean)
+        self.register_buffer("std", std)
+
+    @torch.no_grad()  # 仅用于预处理与 trunk 前传（不需要对 trunk 求梯度）
+    def _prep(self, x):
+        # x: [N,1,H,W] 或 [N,3,H,W]，值域 [0,1] / [0,255] 都可以（下方统一到 [0,1]）
+        if x.dtype != torch.float32:
+            x = x.float()
+        if x.max() > 1.5:  # 粗略判断是否为 0..255
+            x = x / 255.0
+        if x.shape[1] == 1:
+            x = x.repeat(1, 3, 1, 1)  # 单通道复制为伪RGB
+        # ImageNet 归一化
+        x = (x - self.mean) / self.std
+        return x
+
+    def forward(self, x):
+        x = self._prep(x)
+        feats = {}
+        for i, layer in enumerate(self.trunk):
+            x = layer(x)
+            if i in self.return_indices:
+                feats[self.LAYER_NAME_BY_IDX[i]] = x
+        return feats
 
 def compute_psnr(img1, img2):
     """计算两张 [0,1] 张量的 PSNR"""
+    if isinstance(img1, np.ndarray):
+        img1 = torch.from_numpy(img1)
+    if isinstance(img2, np.ndarray):
+        img2 = torch.from_numpy(img2)
+
+        # 全部转到同一设备（这里统一到 CPU，且不跟踪梯度）
+    img1 = img1.detach().to('cpu', dtype=torch.float32)
+    img2 = img2.detach().to('cpu', dtype=torch.float32)
     mse = F.mse_loss(img1, img2)
     psnr = 10 * torch.log10(1.0 / mse)
     return psnr.item()
 
-hr_folder = r"C:\Users\vipuser\Desktop\DIV2K_train_HR_gray\DIV2K_train_HR_gray"
-dataset = SRDataset(hr_folder, patch_size=256, scale=4, noise_std=0.01, augment=True)
+# hr_folder = r"D:\data\SR\DIV2K\DIV2K_train_HR_gray"
+# dataset = SRDataset(hr_folder, patch_size=256, scale=4, noise_std=0.01, augment=True)
 #dataset = dataset[0]
 #print(dataset['x'].shape, dataset['y'].shape, dataset['Aty'].shape)
 
@@ -68,36 +121,36 @@ dataset = SRDataset(hr_folder, patch_size=256, scale=4, noise_std=0.01, augment=
 
 """### Trainer"""
 
-def train_autoencoder(model, train_loader, num_epochs=10, learning_rate=0.001):
-    criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model.to(device)
-
-    for epoch in range(num_epochs):
-        for data in train_loader:
-            y = data['y'].to(device)
-            x = data['x'].to(device)
-            # print("x size: ", x.size())
-            # print("Input size: ", y.size())
-            output = model(y)
-            loss = criterion(output, x)
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-        print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {loss.item():.4f}')
-
-
-transform = transforms.Compose([
-    transforms.ToPILImage(),
-    transforms.ToTensor(),
-])
+# def train_autoencoder(model, train_loader, num_epochs=10, learning_rate=0.001):
+#     criterion = nn.MSELoss()
+#     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+#     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+#     model.to(device)
+#
+#     for epoch in range(num_epochs):
+#         for data in train_loader:
+#             y = data['y'].to(device)
+#             x = data['x'].to(device)
+#             # print("x size: ", x.size())
+#             # print("Input size: ", y.size())
+#             output = model(y)
+#             loss = criterion(output, x)
+#
+#             optimizer.zero_grad()
+#             loss.backward()
+#             optimizer.step()
+#         print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {loss.item():.4f}')
+#
+#
+# transform = transforms.Compose([
+#     transforms.ToPILImage(),
+#     transforms.ToTensor(),
+# ])
 
 # dataset = InfraredDataset(hr_dir, lr_dir, transform=transform)
 # Test test_data with 2 samples
-test_loader = DataLoader(dataset, batch_size=1, shuffle=True)
-autoencoder = Autoencoder()
+# test_loader = DataLoader(dataset, batch_size=1, shuffle=True)
+# autoencoder = Autoencoder()
 #train_autoencoder(autoencoder, test_loader)
 
 """## Unroll VBA model
@@ -136,37 +189,135 @@ class Trainer(object):
             raise NotImplementedError("Unsupported model: {}".format(self.model))
         return model
 
-    # def count_params(self, module, prefix=""):
-    #     """递归统计模块及其子模块的参数数量"""
-    #     total = 0
-    #     # 遍历模型的子模块（必须传入模型实例，才能调用 named_children()）
-    #     for name, child in module.named_children():
-    #         child_params = sum(p.numel() for p in child.parameters() if p.requires_grad)
-    #         total += child_params
-    #         print(f"{prefix}{name}: {child_params:,}")
-    #     print(f"{prefix}Total: {total:,}\n")
-    #     return total
-
 
     def _get_dataset(self):
         if self.dataset == 'infrared':
-            hr_folder = r"C:\Users\vipuser\Desktop\DIV2K_train_HR_gray\DIV2K_train_HR_gray"
-            dataset = SRDataset(hr_folder, patch_size=256, scale=4, noise_std=0.01, augment=True,limit=600)
-            # dataset = SRDataset(hr_folder, patch_size=256, scale=4, noise_std=0.01, augment=True)
+            dataset = SRDataset(
+                hr_root=r"C:\Users\vipuser\train_LR_HR\train_LR_HR\HR_patches",
+                lr_root=r"C:\Users\vipuser\train_LR_HR\train_LR_HR\LR",
+                scale=4
+            )
         else:
             raise NotImplementedError("Unsupported dataset: {}".format(self.dataset))
         return dataset
 
+    def _get_train_val_datasets(self, val_ratio=0.1):
+        dataset = self._get_dataset()
+        total_len = len(dataset)
+        val_len = int(total_len * val_ratio)
+        train_len = total_len - val_len
+        train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_len, val_len])
+        return train_dataset, val_dataset
+
     def _get_loss_func(self):
-        if self.loss == 'mse':
-            loss_fn = nn.MSELoss()
-        elif self.loss == 'ce':
-            loss_fn = nn.CrossEntropyLoss()
-        elif self.loss == 'bce':
-            loss_fn = nn.BCEWithLogitsLoss()
+        def tv_loss_aniso(x, reduction='mean'):
+            Dhx = x - torch.roll(x, shifts=1, dims=3)
+            Dvx = x - torch.roll(x, shifts=1, dims=2)
+            tv = torch.abs(Dhx) + torch.abs(Dvx)
+            return tv.mean() if reduction == 'mean' else (tv.sum() if reduction == 'sum' else tv)
+
+        def tv_loss_iso(x, eps=1e-3, reduction='mean'):
+            Dhx = x - torch.roll(x, shifts=1, dims=3)
+            Dvx = x - torch.roll(x, shifts=1, dims=2)
+            tv = torch.sqrt(Dhx * Dhx + Dvx * Dvx + eps)
+            return tv.mean() if reduction == 'mean' else (tv.sum() if reduction == 'sum' else tv)
+
+        def tv_loss_charbonnier(x, eps=1e-3, reduction='mean'):
+            Dhx = x - torch.roll(x, shifts=1, dims=3)
+            Dvx = x - torch.roll(x, shifts=1, dims=2)
+            tv = torch.sqrt(Dhx.pow(2) + Dvx.pow(2) + eps * eps)
+            return tv.mean() if reduction == 'mean' else (tv.sum() if reduction == 'sum' else tv)
+
+        loss_name = (self.loss or 'mse').lower()
+        if 'mse' in loss_name:
+            base_loss_fn = nn.MSELoss()
+        elif 'bce' in loss_name:
+            base_loss_fn = nn.BCEWithLogitsLoss()
+        elif 'ce' in loss_name:
+            base_loss_fn = nn.CrossEntropyLoss()
         else:
-            raise NotImplementedError("Unsupported loss: {}".format(self.loss))
-        return loss_fn
+            raise NotImplementedError(f"Unsupported loss: {self.loss}")
+
+        # --- 是否叠加 TV ---
+        use_tv = '+tv' in loss_name
+        lambda_tv = getattr(self, 'lambda_tv', 1e-4)
+        tv_type = getattr(self, 'tv_type', 'charb').lower()
+
+        if tv_type == 'aniso':
+            tv_fn = tv_loss_aniso
+        elif tv_type == 'iso':
+            tv_fn = tv_loss_iso
+        else:
+            tv_fn = tv_loss_charbonnier  # 默认 Charbonnier
+
+        class perceptual_loss(nn.Module):
+            """
+            多层加权感知损失（默认使用 relu1_2 / relu2_2 / relu3_4）。
+            可与像素/对抗损失组合：total = lambda_p * P + lambda_l1 * L1 + ...
+            """
+
+            def __init__(self,
+                         layers=("relu1_2", "relu2_2", "relu3_4"),
+                         layer_weights={"relu1_2": 1.0, "relu2_2": 1.0, "relu3_4": 1.0},
+                         criterion="l1"):
+                super().__init__()
+                self.feat_net = TruncatedVGG19_UpToRelu34(return_layers=layers)
+                self.layers = layers
+                self.layer_weights = layer_weights
+                if criterion == "l1":
+                    self.crit = F.l1_loss
+                elif criterion == "l2":
+                    self.crit = F.mse_loss
+                else:
+                    raise ValueError("criterion must be 'l1' or 'l2'")
+
+            def forward(self, pred, target):
+                # pred/target: [N,1,H,W] 或 [N,3,H,W]，值域任意（内部会标准化处理）
+                # 重要：不要对 feat_net 反向；默认已冻结参数，只对 pred 传播梯度
+                with torch.no_grad():
+                    feat_t = self.feat_net(target)
+                feat_p = self.feat_net(pred)  # 这里不加 no_grad，以便对 pred 反向
+
+                loss = 0.0
+                for name in self.layers:
+                    w = self.layer_weights.get(name, 1.0)
+                    loss = loss + w * self.crit(feat_p[name], feat_t[name])
+                return loss
+
+        use_per = ('+per' in loss_name)
+        lambda_per = 5e-4
+
+        if use_per:
+            perceptual_loss_model = perceptual_loss().to(self.device)
+            perceptual_loss_model.eval()  # 冻结梯度计算
+            for p in perceptual_loss_model.parameters():
+                p.requires_grad_(False)
+
+            # 封装函数接口
+            def perceptual_loss_fn(pred, target):
+                return perceptual_loss_model(pred, target)
+        else:
+            perceptual_loss_fn = None
+
+        # --- 组合损失：保持签名 (pred, target) ---
+        def combined_loss(pred, target):
+            base = base_loss_fn(pred, target)
+            # loss_total = base
+            # if use_tv:
+            #     loss_total += lambda_tv * tv_fn(pred)
+            # if use_per:
+            #     loss_total += lambda_per * perceptual_loss_fn(pred, target)
+            # return loss_total
+            loss_tv = lambda_tv * tv_fn(pred) if use_tv else 0.
+            loss_per = lambda_per * perceptual_loss_fn(pred, target) if use_per else 0.
+
+            # ------ 这里加入打印（三者比例） ------
+            if torch.rand(1).item() < 0.01:  # 避免打印太多，可选
+                print(f"[Loss Debug] base={base.item():.6f}, tv={loss_tv:.6f}, per={loss_per:.6f}")
+
+            loss_total = base + loss_tv + loss_per
+            return loss_total
+        return combined_loss
 
     def _get_optimizer(self, model):
         if self.optimizer == 'adam':
@@ -174,26 +325,42 @@ class Trainer(object):
         elif self.optimizer == 'sgd':
             optimizer = torch.optim.SGD(model.parameters(), lr=self.lr, momentum=0.9)
         elif self.optimizer == 'adamW':
-            optimizer = torch.optim.AdamW(model.parameters(), lr=self.lr, weight_decay=1e-4)
+            optimizer = torch.optim.AdamW(model.parameters(), lr=self.lr)
         else:
             raise NotImplementedError("Unsupported optimizer: {}".format(self.optimizer))
 
         optimizer.param_groups[0]['lr'] = self.lr
-        return optimizer
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.5)
+        # 或者换成 CosineAnnealingLR / ReduceLROnPlateau
+        return optimizer, scheduler
+        # return optimizer
 
-    def _save_reconstructed_image(self, recon, x_true,y, epoch, iter_num):
+    def _save_reconstructed_image(self, recon, x_true, y, epoch, iter_num, save_dir=None):
         """保存重构图像和真实图像"""
         # 确保图像在CPU上且为numpy格式，只取batch中的第一张图像
-        recon = recon[3].detach().cpu().squeeze().numpy()
-        x_true = x_true[3].detach().cpu().squeeze().numpy()
-        y = y[3].detach().cpu().squeeze().numpy()
+        k = 3
+        # 先保持 torch.Tensor（[0,1]）算指标
+        recon = recon[k, 0].detach()  # [H,W], float
+        x_true = x_true[k, 0].detach()
+        y = y[k, 0].detach().cpu()
+        psnr_recon = compute_psnr(recon, x_true)
+        recon_np = recon.cpu().numpy()
+        xtrue_np = x_true.cpu().numpy()
+        ssim_recon = ssim_metric(xtrue_np, recon_np, data_range=1.0)
 
-        recon = (recon * 255).astype(np.uint8)
-        x_true = (x_true * 255).astype(np.uint8)
-        y = (y * 255).astype(np.uint8)
+        recon = (np.clip(recon_np, 0, 1) * 255.0 + 0.5).astype(np.uint8)
+        x_true = (np.clip(xtrue_np, 0, 1) * 255.0 + 0.5).astype(np.uint8)
+        y = (np.clip(y.numpy(), 0, 1) * 255.0 + 0.5).astype(np.uint8)
 
         # 创建图像保存路径
-        save_path = os.path.join(self.img_save_dir, 'train3', f"epoch_{epoch}_iter_{iter_num}")
+        # save_path = os.path.join(self.img_save_dir, 'invSigmak_mse_batch=8_segUnet_lr=0.005_numworkers2_init=10', f"epoch_{epoch}_iter_{iter_num}")
+        if save_dir is None:
+            # 原先行为： self.img_save_dir + 固定子目录 + epoch_iter
+            save_path = os.path.join(self.img_save_dir, 'invSigmak_mse_batch=8_segUnet_lr=0.005_numworkers2_init=10',
+                                     f"epoch_{epoch}_iter_{iter_num}")
+        else:
+            save_path = save_dir
+
         os.makedirs(save_path, exist_ok=True)
 
         # 绘制并保存重构图像
@@ -213,103 +380,129 @@ class Trainer(object):
 
         plt.subplot(1, 3, 3)
         plt.imshow(recon, cmap='gray')
-        plt.title('Reconstructed Image')
+        plt.title(f'Reconstructed\nPSNR={psnr_recon:.2f} dB  SSIM={ssim_recon:.4f}')
         plt.axis('off')
         plt.savefig(os.path.join(save_path, 'reconstructed.png'))
 
         plt.tight_layout()  # 调整子图间距
         plt.savefig(os.path.join(save_path, 'comparison.png'))
-
-        # 绘制差异图
-        # diff = np.abs(recon - x_true)
-        # plt.subplot(1, 3, 3)
-        # plt.imshow(diff, cmap='viridis')
-        # plt.title('Difference')
-        # plt.axis('off')
-        # plt.colorbar()
-        # plt.savefig(os.path.join(save_path, 'difference.png'))
-
         plt.close()
 
-    def training(self, writer):
+    def save_model(self, model):
+        """保存当前训练的模型参数"""
+        save_path = os.path.join(self.model_save_dir, "model_ln_mse_lr0.005.pth")
+        torch.save(model.state_dict(), save_path)
+        print(f"[INFO] 模型已保存至 {save_path}")
+        return save_path
 
+    def training(self, writer):
         dataset = self._get_dataset()
         print("Load dataset...")
-        test_loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
+        # print("Dataset size:", len(dataset))
+        train_dataset, val_dataset = self._get_train_val_datasets(val_ratio=0.1)
+        train_loader = DataLoader(train_dataset,
+                          batch_size=self.batch_size,
+                          shuffle=True,
+                          num_workers=self.num_workers,
+                          pin_memory=True)
+        val_loader = DataLoader(val_dataset,
+                                batch_size=self.batch_size,
+                                shuffle=False,
+                                num_workers=self.num_workers,
+                                pin_memory=True)
         loss_func = self._get_loss_func()
         model = self._get_model()
-        # print("参数分布：")
-        # self.count_params(model)
-        optimizer = self._get_optimizer(model)
-        best_val_score = 0
-        # early_stopper = EarlyStopping(patience=5)
+        optimizer, scheduler = self._get_optimizer(model)
+        # optimizer = self._get_optimizer(model)
 
         print("Start training...")
-        losses, psnrs, ssims = [], [], []
-
-        def plot_progress():
-            """保存到当前epoch为止的曲线"""
-            epochs = range(1, len(losses) + 1)
-            plt.figure(figsize=(12, 4))
+        # losses, psnrs, ssims = [], [], []
+        train_losses, train_psnrs, train_ssims = [], [], []
+        val_losses, val_psnrs, val_ssims = [], [], []
+        def plot_progress(epoch,
+                          train_losses, train_psnrs, train_ssims,
+                          val_losses, val_psnrs, val_ssims):
+            epochs = range(1, epoch + 1)
+            plt.figure(figsize=(15, 4))
+            """保存到当前 epoch 为止的曲线"""
+            # -------- Loss --------
             plt.subplot(1, 3, 1)
-            plt.plot(epochs, losses, marker='o')
-            plt.title('Average Loss')
+            plt.plot(epochs, train_losses[:epoch], marker='o', label='Train Loss')
+            plt.plot(epochs, val_losses[:epoch], marker='o', label='Val Loss')
+            plt.title('Loss')
             plt.xlabel('Epoch')
             plt.grid(True)
+            plt.legend()
 
+            # -------- PSNR --------
             plt.subplot(1, 3, 2)
-            plt.plot(epochs, psnrs, marker='o')
+            plt.plot(epochs, train_psnrs[:epoch], marker='o', label='Train PSNR')
+            plt.plot(epochs, val_psnrs[:epoch], marker='o', label='Val PSNR')
             plt.title('PSNR')
             plt.xlabel('Epoch')
             plt.grid(True)
+            plt.legend()
 
+            # -------- SSIM --------
             plt.subplot(1, 3, 3)
-            plt.plot(epochs, ssims, marker='o')
+            plt.plot(epochs, train_ssims[:epoch], marker='o', label='Train SSIM')
+            plt.plot(epochs, val_ssims[:epoch], marker='o', label='Val SSIM')
             plt.title('SSIM')
             plt.xlabel('Epoch')
             plt.grid(True)
+            plt.legend()
 
             plt.tight_layout()
-            plt.savefig(os.path.join(self.img_save_dir, 'train3', f"progress_until_epoch_{len(losses)}.png"))
+            save_dir = os.path.join(self.img_save_dir, 'invSigmak_mse_batch=8_segUnet_lr=0.005_numworkers2_init=10')
+            os.makedirs(save_dir, exist_ok=True)
+            save_path = os.path.join(save_dir, f"progress_epoch_{epoch}.png")
+            plt.savefig(save_path)
             plt.close()
-            print(f"[INFO] 保存至 epoch {len(losses)} 的曲线 progress_until_epoch_{len(losses)}.png")
+            print(f"[INFO] 保存训练曲线到 {save_path}")
 
-        def signal_handler(sig, frame):
-            print("\n[INFO] 检测到中断信号，保存当前训练进度曲线...")
-            plot_progress()  # 尝试保存图像
-            exit(0)  # 正常退出
-
-        signal.signal(signal.SIGINT, signal_handler)
+        diag_paths = {  # kid -> npy 路径
+            0: "./diag_full/diagAtA_k00_full.npy",
+            1: "./diag_full/diagAtA_k01_full.npy",
+            2: "./diag_full/diagAtA_k02_full.npy",
+            3: "./diag_full/diagAtA_k03_full.npy",
+            4: "./diag_full/diagAtA_k04_full.npy",
+            5: "./diag_full/diagAtA_k05_full.npy",
+            6: "./diag_full/diagAtA_k06_full.npy",
+            7: "./diag_full/diagAtA_k07_full.npy",
+            8: "./diag_full/diagAtA_k08_full.npy",
+            9: "./diag_full/diagAtA_k09_full.npy",
+        }
 
         for epoch in range(self.epochs):
             model.train()
             train_loss = 0
-            train_correct = 0
-            epoch_psnr, epoch_ssim = 0, 0
+            val_loss = 0
+            train_psnr, train_ssim = 0, 0
+            val_psnr, val_ssim = 0, 0
             count = 0
-            best_model_psnr = -1
-            best_model_path = os.path.join('results', "best_model.pth")
-            best_psnr_in_epoch = -1
-            best_recon = None
-            best_x_true = None
-            best_y = None
 
             # Training
             # for iter_num, data in enumerate(test_loader):
-            loop = tqdm(enumerate(test_loader), total=len(test_loader), desc=f"Epoch {epoch + 1}/{self.epochs}")
-            for iter_num, data in loop:
-            # dataset returns a tuple (x, y, Aty)
-                x_true, y, Aty = data
+            loop = tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Epoch {epoch + 1}/{self.epochs}")
+            for iter_num, (x_true, idxs) in loop:
                 x_true = x_true.to(self.device)
-                y = y.to(self.device)
-                Aty = Aty.to(self.device)
+                x_true = x_true.to(self.device, non_blocking=True)  # [B,1,H,W]
+
+                # 本批统一 kernel
+                kid_val = random.randint(0, 9)
+                # 批量取 LR/Aty
+                lr_list, Aty_list = [], []
+                for i in idxs.tolist():
+                    lr_i, Aty_i = dataset.get_item_with_kid(int(i), kid_val)
+                    lr_list.append(lr_i)
+                    Aty_list.append(Aty_i)
+                y = torch.stack(lr_list, dim=0).to(self.device, non_blocking=True)  # [B,1,h,w]
+                Aty = torch.stack(Aty_list, dim=0).to(self.device, non_blocking=True)  # [B,1,H,W]
+                diagAtA_np = np.load(diag_paths[kid_val])
                 mk_0 = F.interpolate(y, scale_factor=4, mode='bicubic', align_corners=False)
-                # mk_0 = Aty
-                # print('mk_0:', mk_0.min().item(), mk_0.max().item(), mk_0.mean().item())
                 mk = mk_0
                 mk_1 = mk_0
                 invSigmak_1, invSigmak, lambdak = self.initialization(Aty)
-                diagAtA_np = np.load('diagAtA_bicubic2.npy')
                 diagAtA = torch.from_numpy(diagAtA_np)
                 diagAtA = torch.clamp(diagAtA, min=0.0)
                 diagAtA = diagAtA.to(self.device)
@@ -317,124 +510,107 @@ class Trainer(object):
                 output = model(Aty, diagAtA, mk_1, invSigmak_1, mk, invSigmak, lambdak)
                 recon = output[2]
 
-
                 for i in range(recon.shape[0]):
                     recon_t = recon[i, 0].detach()
                     hr_t = x_true[i, 0].detach()
                     Aty_t = Aty[i, 0].detach()
-                    psnr_val = compute_psnr(recon_t, hr_t)
+                    psnr_train = compute_psnr(recon_t, hr_t)
                     recon_np_i = recon_t.cpu().numpy()  # 仅单个样本转 CPU，开销小
                     hr_np_i = hr_t.cpu().numpy()
-                    ssim_val = structural_similarity(hr_np_i, recon_np_i, data_range=1.0)
-                    psnr_Aty = compute_psnr(Aty_t, hr_t)
-                    epoch_psnr += psnr_val
-                    epoch_ssim += ssim_val
+                    ssim_train = structural_similarity(hr_np_i, recon_np_i, data_range=1.0)
+                    train_psnr += psnr_train
+                    train_ssim += ssim_train
                     count += 1
-
-                    # 更新 epoch 内最优 PSNR
-                    if psnr_val > best_psnr_in_epoch:
-                        best_psnr_in_epoch = psnr_val
-                        best_recon = recon[i:i + 1].clone()  # 保留 batch 中对应图
-                        best_x_true = x_true[i:i + 1].clone()
-                        best_y = y[i:i + 1].clone()
-                        best_Aty = Aty[i:i + 1].clone()
-                        best_ssim_val = ssim_val
-                    # 输出batch中所有样本的结果
-                    # print(f"Batch {iter_num} | "
-                    #       f"PSNR(Aty)={psnr_Aty:.2f}  | "
-                    #       f"PSNR(Recon)={psnr_val:.2f}   |"
-                    #       f"SSIM(Recon)={ssim_val:.2f}")
-                # print(f"[DEBUG] recon range: {recon.min():.6f} ~ {recon.max():.6f}")
-                # 保存batch中最后一个样本的recon
                 if iter_num == 0:
                     self._save_reconstructed_image(recon, x_true, y, epoch, iter_num)
 
                 loss = loss_func(output[2], x_true)
                 # print('\n Loss Epoch {} : {:.4f}\n'.format(epoch, loss))
                 train_loss += loss.item()
-                # 在进度条右侧显示当前batch最后一个样本的关键指标（动态更新）
                 loop.set_postfix({
                     "Loss": f"{loss.item():.4f}",
-                    "Last PSNR": f"{psnr_val:.2f}dB",
-                    "Last SSIM": f"{ssim_val:.4f}"
+                    "Last PSNR": f"{psnr_train:.2f}dB",
+                    "Last SSIM": f"{ssim_train:.4f}"
                 })
                 loss.backward()
-                # print(invSigmak.grad is None)
-                total_grad_norm = 0
 
                 if iter_num % self.log_interval == 0:
                     optimizer.step()
                     optimizer.zero_grad()
+            scheduler.step()
 
+            avg_train_loss = train_loss / len(train_loader)
+            avg_train_psnr = train_psnr / count
+            avg_train_ssim = train_ssim / count
+            # ---------------------------
+            # VALIDATION
+            # ---------------------------
+            model.eval()
+            val_loss = 0.0
+            val_psnr = 0.0
+            val_ssim = 0.0
+            val_count = 0
 
-            avg_loss = train_loss / len(test_loader)
-            avg_psnr = epoch_psnr / count
-            avg_ssim = epoch_ssim / count
-            # if avg_psnr > best_model_psnr:
-            #     best_model_psnr = avg_psnr
-            #     torch.save(model.state_dict(), best_model_path)
-            #     print(f"✅ Saved new best model (Epoch {epoch}, PSNR={best_model_psnr:.2f}dB)")
+            with torch.no_grad():
+                for x_true, idxs in val_loader:
+                    x_true = x_true.to(self.device, non_blocking=True)
 
-            losses.append(avg_loss)
-            psnrs.append(avg_psnr)
-            ssims.append(avg_ssim)
-            # print('\nTraining Performance Epoch {}: Average loss: {:.4f}\n'.format(
-            #     epoch, train_loss / len(test_loader)))
-            print(f'Epoch {epoch+1}: Loss={avg_loss:.4f}, PSNR={avg_psnr:.2f}, SSIM={avg_ssim:.4f}\n')
+                    # 选 kernel 同训练逻辑保持一致
+                    kid_val = random.randint(0, 9)
+                    lr_list, Aty_list = [], []
+                    for i in idxs.tolist():
+                        lr_i, Aty_i = dataset.get_item_with_kid(int(i), kid_val)
+                        lr_list.append(lr_i)
+                        Aty_list.append(Aty_i)
 
-            # === 保存当前epoch最优样本图像 ===
-            # if best_recon is not None:
-            #     recon_img = (best_recon.detach().cpu().squeeze().numpy() * 255).astype(np.uint8)
-            #     y_img = (best_y.detach().cpu().squeeze().numpy() * 255).astype(np.uint8)
-            #     gt_img = (best_x_true.detach().cpu().squeeze().numpy() * 255).astype(np.uint8)
-            #     psnr_Aty = compute_psnr(best_Aty, best_x_true)
-            #
-            #     save_path = os.path.join(self.img_save_dir, 'train3', f"best_epoch_{epoch}")
-            #     os.makedirs(save_path, exist_ok=True)
-            #
-            #     plt.figure(figsize=(12, 4))
-            #     plt.subplot(1, 3, 1)
-            #     plt.imshow(gt_img, cmap='gray')
-            #     plt.title('GT')
-            #     plt.axis('off')
-            #
-            #     plt.subplot(1, 3, 2)
-            #     plt.imshow(y_img, cmap='gray')
-            #     plt.title(f"Aty\nPSNR={psnr_Aty:.2f}dB")
-            #     plt.axis('off')
-            #
-            #     plt.subplot(1, 3, 3)
-            #     plt.imshow(recon_img, cmap='gray')
-            #     plt.title(f"Best Recon\nPSNR={best_psnr_in_epoch:.2f}dB SSIM={best_ssim_val:.4f}")
-            #     plt.axis('off')
-            #
-            #     plt.tight_layout()
-            #     plt.savefig(os.path.join(save_path, 'best_recon.png'))
-            #     plt.close()
+                    y = torch.stack(lr_list, dim=0).to(self.device)
+                    Aty = torch.stack(Aty_list, dim=0).to(self.device)
 
-        plot_progress()
-        epochs = range(1, self.epochs + 1)
-        plt.figure(figsize=(12, 4))
-        plt.subplot(1, 3, 1)
-        plt.plot(epochs, losses, marker='o')
-        plt.title('Average Loss')
-        plt.xlabel('Epoch')
-        plt.grid(True)
+                    diagAtA_np = np.load(diag_paths[kid_val])
+                    diagAtA = torch.from_numpy(diagAtA_np).clamp(min=0).to(self.device)
 
-        plt.subplot(1, 3, 2)
-        plt.plot(epochs, psnrs, marker='o')
-        plt.title('PSNR')
-        plt.xlabel('Epoch')
-        plt.grid(True)
+                    mk_0 = F.interpolate(y, scale_factor=4, mode='bicubic', align_corners=False)
+                    mk_1 = mk_0
+                    mk = mk_0
 
-        plt.subplot(1, 3, 3)
-        plt.plot(epochs, ssims, marker='o')
-        plt.title('SSIM')
-        plt.xlabel('Epoch')
-        plt.grid(True)
+                    invSigmak_1, invSigmak, lambdak = self.initialization(Aty)
+                    output = model(Aty, diagAtA, mk_1, invSigmak_1, mk, invSigmak, lambdak)
+                    recon = output[2]
 
-        plt.tight_layout()
-        plt.show()
+                    v_loss = loss_func(recon, x_true)
+                    val_loss += v_loss.item()
+
+                    for b in range(recon.shape[0]):
+                        recon_t = recon[b, 0].detach()
+                        hr_t = x_true[b, 0].detach()
+                        psnr_val = compute_psnr(recon_t, hr_t)
+                        ssim_val = structural_similarity(hr_t.cpu().numpy(), recon_t.cpu().numpy(), data_range=1.0)
+                        val_psnr += psnr_val
+                        val_ssim += ssim_val
+                        val_count += 1
+
+            avg_val_loss = val_loss / len(val_loader)
+            avg_val_psnr = val_psnr / val_count
+            avg_val_ssim = val_ssim / val_count
+
+            # 保存到历史
+            train_losses.append(avg_train_loss)
+            train_psnrs.append(avg_train_psnr)
+            train_ssims.append(avg_train_ssim)
+
+            val_losses.append(avg_val_loss)
+            val_psnrs.append(avg_val_psnr)
+            val_ssims.append(avg_val_ssim)
+
+            # 打印并保存模型/画图
+            print(
+                f'Epoch {epoch}: Train Loss={avg_train_loss:.4f}, Train PSNR={avg_train_psnr:.2f}, Train SSIM={avg_train_ssim:.4f}')
+            print(f'[VAL] Loss={avg_val_loss:.4f} PSNR={avg_val_psnr:.2f} SSIM={avg_val_ssim:.4f}\n')
+            self.save_model()
+            plot_progress(epoch + 1,
+                          train_losses, train_psnrs, train_ssims,
+                          val_losses, val_psnrs, val_ssims)
+
         # torch.save(model.state_dict(), './output/final.ckpt')
                 # pred = output.argmax(dim=1, keepdim=True)
                 # train_correct = pred.eq(target.view_as(pred)).sum().item()
@@ -485,10 +661,8 @@ class Trainer(object):
     # def evaluate(model, test_loader):
 
     def initialization(self, mk_0):
-        invSigmak_1 = 100 * torch.ones(mk_0.shape).to(self.device)
-        invSigmak = 100 * torch.ones(mk_0.shape).to(self.device)
-        # invSigmak_1 = 10 * torch.ones(mk_0.shape).to(self.device)
-        # invSigmak = 10 * torch.ones(mk_0.shape).to(self.device)
+        invSigmak_1 = 10 * torch.ones(mk_0.shape).to(self.device)
+        invSigmak = 10 * torch.ones(mk_0.shape).to(self.device)
 
 
         # operators
@@ -505,9 +679,9 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     args= Args(device=device, moddir="./models", outdir='./outputs',
                 logdir='./logs', imgdir='./images', resdir='./results', initdir='./inits',
-                num_classes=4, model='UnrollVBA', lr=0.001, optimizer='adam',
-                dataset='infrared', batch_size=4, epochs=80, train_size=1.0,
-                num_workers=2, loss='mse', log_interval=8)
+                num_classes=2, model='UnrollVBA', lr=0.001, optimizer='adam',
+                dataset='infrared', batch_size=8, epochs=100, train_size=1.0,
+                num_workers=4, loss='mse+tv+per', log_interval=8)
     # args = get_arguments()
     # 数据集路径
 
