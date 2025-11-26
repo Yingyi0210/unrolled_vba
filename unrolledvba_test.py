@@ -27,16 +27,39 @@ import glob
 import os
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from config import Args
+from args import Args
 import random
 # from autoencoder import Autoencoder
 import matplotlib.pyplot as plt
 from skimage.metrics import peak_signal_noise_ratio, structural_similarity
-from dataset import SRDataset
+from dataset import *
 from operators import *
 import signal
 from torchvision.models import vgg19
 from skimage.metrics import structural_similarity as ssim_metric
+
+class LossMeter:
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.base_total = 0.0
+        self.tv_total = 0.0
+        self.per_total = 0.0
+        self.count = 0
+
+    def update(self, base, tv, per, n=1):
+        self.base_total += base * n
+        self.tv_total += tv * n
+        self.per_total += per * n
+        self.count += n
+
+    def report(self):
+        if self.count == 0:
+            return 0, 0, 0
+        return (self.base_total / self.count,
+                self.tv_total / self.count,
+                self.per_total / self.count)
 
 class TruncatedVGG19_UpToRelu34(nn.Module):
     """
@@ -152,11 +175,17 @@ def compute_psnr(img1, img2):
 # test_loader = DataLoader(dataset, batch_size=1, shuffle=True)
 # autoencoder = Autoencoder()
 #train_autoencoder(autoencoder, test_loader)
+class SubsetWithKid(Subset):
+    def get_item_with_kid(self, subset_idx, kid, snr=None):
+        # subset_idx：子集内索引（0~len(val_dataset)-1）
+        # 内部映射到原始数据集索引
+        real_idx = self.indices[subset_idx]
+        # 调用原始数据集的 get_item_with_kid（你的原始数据集已有这个方法，没问题）
+        return self.dataset.get_item_with_kid(real_idx, kid=kid, snr=snr)
 
 """## Unroll VBA model
 
 """### VBA Trainer
-
 
 class Trainer(object):
 
@@ -193,20 +222,33 @@ class Trainer(object):
     def _get_dataset(self):
         if self.dataset == 'infrared':
             dataset = SRDataset(
-                hr_root=r"C:\Users\vipuser\train_LR_HR\train_LR_HR\HR_patches",
-                lr_root=r"C:\Users\vipuser\train_LR_HR\train_LR_HR\LR",
-                scale=4
-            )
+                hr_root=r"C:\Users\vipuser\train_LR_HR_5x5\train_LR_HR_5x5\HR_patches",
+                lr_root=r"C:\Users\vipuser\train_LR_HR_5x5\train_LR_HR_5x5\LR",
+                scale=4)
+            # train_dataset = SRDataset(
+            #     hr_root=r"C:\Users\vipuser\train_LR_HR_5x5\train_LR_HR_5x5\HR_patches",
+            #     lr_root=r"C:\Users\vipuser\train_LR_HR_5x5\train_LR_HR_5x5\LR",
+            #     scale=4
+            # )
+            # val_dataset = SRDataset(
+            #     hr_root=r"C:\Users\vipuser\val_LR_HR_5x5\HR_patches",
+            #     lr_root=r"C:\Users\vipuser\val_LR_HR_5x5\LR",
+            #     scale=4
+            # )
         else:
             raise NotImplementedError("Unsupported dataset: {}".format(self.dataset))
+        # return train_dataset, val_dataset
         return dataset
 
-    def _get_train_val_datasets(self, val_ratio=0.1):
+    def _get_train_val_datasets(self, val_ratio=0.2):
         dataset = self._get_dataset()
         total_len = len(dataset)
         val_len = int(total_len * val_ratio)
         train_len = total_len - val_len
-        train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_len, val_len])
+        torch.manual_seed(42) # 固定数据集
+        train_subset, val_subset = torch.utils.data.random_split(dataset, [train_len, val_len])
+        val_dataset = SubsetWithKid(dataset, val_subset.indices)
+        train_dataset = train_subset
         return train_dataset, val_dataset
 
     def _get_loss_func(self):
@@ -285,7 +327,7 @@ class Trainer(object):
                 return loss
 
         use_per = ('+per' in loss_name)
-        lambda_per = 5e-4
+        lambda_per = 1e-3
 
         if use_per:
             perceptual_loss_model = perceptual_loss().to(self.device)
@@ -298,7 +340,7 @@ class Trainer(object):
                 return perceptual_loss_model(pred, target)
         else:
             perceptual_loss_fn = None
-
+        self.loss_meter = LossMeter()
         # --- 组合损失：保持签名 (pred, target) ---
         def combined_loss(pred, target):
             base = base_loss_fn(pred, target)
@@ -310,10 +352,14 @@ class Trainer(object):
             # return loss_total
             loss_tv = lambda_tv * tv_fn(pred) if use_tv else 0.
             loss_per = lambda_per * perceptual_loss_fn(pred, target) if use_per else 0.
+            self.loss_meter.update(base.item(),
+                                   float(loss_tv),
+                                   float(loss_per),
+                                   n=8)
 
             # ------ 这里加入打印（三者比例） ------
-            if torch.rand(1).item() < 0.01:  # 避免打印太多，可选
-                print(f"[Loss Debug] base={base.item():.6f}, tv={loss_tv:.6f}, per={loss_per:.6f}")
+            # if torch.rand(1).item() < 0.01:  # 避免打印太多，可选
+            #     print(f"[Loss Debug] base={base.item():.6f}, tv={loss_tv:.6f}, per={loss_per:.6f}")
 
             loss_total = base + loss_tv + loss_per
             return loss_total
@@ -322,6 +368,7 @@ class Trainer(object):
     def _get_optimizer(self, model):
         if self.optimizer == 'adam':
             optimizer = torch.optim.Adam(model.parameters(), lr=self.lr)
+            # optimizer = torch.optim.Adam(model.parameters(), lr=self.lr, weight_decay = 1e-4)
         elif self.optimizer == 'sgd':
             optimizer = torch.optim.SGD(model.parameters(), lr=self.lr, momentum=0.9)
         elif self.optimizer == 'adamW':
@@ -331,18 +378,22 @@ class Trainer(object):
 
         optimizer.param_groups[0]['lr'] = self.lr
         scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.5)
+        # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        #     optimizer,
+        #     T_max=self.epochs,  # 学习率衰减的总周期（等于总epoch数，最后一个epoch LR→0）
+        #     eta_min=1e-6  # 最小学习率（避免衰减到0导致数值不稳定，设1e-8即可）
+        # )
         # 或者换成 CosineAnnealingLR / ReduceLROnPlateau
         return optimizer, scheduler
         # return optimizer
 
-    def _save_reconstructed_image(self, recon, x_true, y, epoch, iter_num, save_dir=None):
+
+
+    def _save_train_reconstructed_image(self, recon, x_true, y, epoch, iter_num, save_dir=None):
         """保存重构图像和真实图像"""
-        # 确保图像在CPU上且为numpy格式，只取batch中的第一张图像
-        k = 3
-        # 先保持 torch.Tensor（[0,1]）算指标
-        recon = recon[k, 0].detach()  # [H,W], float
-        x_true = x_true[k, 0].detach()
-        y = y[k, 0].detach().cpu()
+        recon = recon[3, 0].detach()  # [H,W], float
+        x_true = x_true[3, 0].detach()
+        y = y[3, 0].detach().cpu()
         psnr_recon = compute_psnr(recon, x_true)
         recon_np = recon.cpu().numpy()
         xtrue_np = x_true.cpu().numpy()
@@ -356,7 +407,7 @@ class Trainer(object):
         # save_path = os.path.join(self.img_save_dir, 'invSigmak_mse_batch=8_segUnet_lr=0.005_numworkers2_init=10', f"epoch_{epoch}_iter_{iter_num}")
         if save_dir is None:
             # 原先行为： self.img_save_dir + 固定子目录 + epoch_iter
-            save_path = os.path.join(self.img_save_dir, 'invSigmak_mse_batch=8_segUnet_lr=0.005_numworkers2_init=10',
+            save_path = os.path.join(self.img_save_dir, 'mse+tv+per_train840x10x4_val_split0.2_batch=8_lr=0.005_numworkers4_init=10M3FD_snr45_tv1e-4_per1e-3','train',
                                      f"epoch_{epoch}_iter_{iter_num}")
         else:
             save_path = save_dir
@@ -388,18 +439,83 @@ class Trainer(object):
         plt.savefig(os.path.join(save_path, 'comparison.png'))
         plt.close()
 
-    def save_model(self, model):
+    def _save_val_reconstructed_image(self, recon, x_true, y, epoch, iter_num, save_dir=None):
+        if not hasattr(self, 'best_psnr'):
+            self.best_psnr = -1
+        if not hasattr(self, 'best_ssim'):
+            self.best_ssim = -1
+        """保存重构图像和真实图像"""
+        recon = recon[3, 0].detach()  # [H,W], float
+        x_true = x_true[3, 0].detach()
+        y = y[3, 0].detach().cpu()
+        psnr_recon = compute_psnr(recon, x_true)
+        recon_np = recon.cpu().numpy()
+        xtrue_np = x_true.cpu().numpy()
+        ssim_recon = ssim_metric(xtrue_np, recon_np, data_range=1.0)
+        if psnr_recon <= self.best_psnr and ssim_recon <= self.best_ssim:
+            return
+
+        recon = (np.clip(recon_np, 0, 1) * 255.0 + 0.5).astype(np.uint8)
+        x_true = (np.clip(xtrue_np, 0, 1) * 255.0 + 0.5).astype(np.uint8)
+        y = (np.clip(y.numpy(), 0, 1) * 255.0 + 0.5).astype(np.uint8)
+
+        # 创建图像保存路径
+        # save_path = os.path.join(self.img_save_dir, 'invSigmak_mse_batch=8_segUnet_lr=0.005_numworkers2_init=10', f"epoch_{epoch}_iter_{iter_num}")
+        if save_dir is None:
+            # 原先行为： self.img_save_dir + 固定子目录 + epoch_iter
+            save_path = os.path.join(self.img_save_dir, 'mse+tv+per_train840x10x4_val_split0.2_batch=8_lr=0.005_numworkers4_init=10M3FD_snr45_tv1e-4_per1e-3', 'val',
+                                    f"epoch_{epoch}_iter_{iter_num}")
+        else:
+            save_path = save_dir
+
+        os.makedirs(save_path, exist_ok=True)
+
+        # 绘制并保存重构图像
+        plt.figure(figsize=(12, 4))
+
+        plt.subplot(1, 3, 1)
+        plt.imshow(x_true, cmap='gray')
+        plt.title('True Image')
+        plt.axis('off')
+        plt.savefig(os.path.join(save_path, 'true.png'))
+
+        plt.subplot(1, 3, 2)
+        plt.imshow(y, cmap='gray')
+        plt.title('Observed (LR)')
+        plt.axis('off')
+        plt.savefig(os.path.join(save_path, 'LR.png'))
+
+        plt.subplot(1, 3, 3)
+        plt.imshow(recon, cmap='gray')
+        plt.title(f'Reconstructed\nPSNR={psnr_recon:.2f} dB  SSIM={ssim_recon:.4f}')
+        plt.axis('off')
+        plt.savefig(os.path.join(save_path, 'reconstructed.png'))
+
+        plt.tight_layout()  # 调整子图间距
+        plt.savefig(os.path.join(save_path, 'comparison.png'))
+        plt.close()
+
+        self.best_psnr = psnr_recon
+        self.best_ssim = ssim_recon
+
+    def save_model(self, model= None, save_path=None):
         """保存当前训练的模型参数"""
-        save_path = os.path.join(self.model_save_dir, "model_ln_mse_lr0.005.pth")
+        model_to_save = model if model is not None else self.model
+        if not isinstance(model_to_save, torch.nn.Module):
+            raise TypeError(f"model_to_save should be nn.Module, got {type(model_to_save)}")
+        if save_path is None:
+            save_dir = os.path.join(self.img_save_dir, "saved_models")
+            os.makedirs(save_dir, exist_ok=True)
+            save_path = os.path.join(save_dir, "mse+tv+per_train840x10x4_val_split0.2_ln_lr0.005_M3FD_snr45_tv1e-4_per1e-3.pth")
         torch.save(model.state_dict(), save_path)
         print(f"[INFO] 模型已保存至 {save_path}")
         return save_path
 
     def training(self, writer):
-        dataset = self._get_dataset()
+        # train_dataset, val_dataset = self._get_dataset()
         print("Load dataset...")
+        train_dataset, val_dataset = self._get_train_val_datasets(val_ratio=0.2)
         # print("Dataset size:", len(dataset))
-        train_dataset, val_dataset = self._get_train_val_datasets(val_ratio=0.1)
         train_loader = DataLoader(train_dataset,
                           batch_size=self.batch_size,
                           shuffle=True,
@@ -418,7 +534,44 @@ class Trainer(object):
         print("Start training...")
         # losses, psnrs, ssims = [], [], []
         train_losses, train_psnrs, train_ssims = [], [], []
+        train_base_losses, train_tv_losses, train_per_losses = [], [], []
+        # train_base_losses, train_per_losses = [], []
         val_losses, val_psnrs, val_ssims = [], [], []
+
+        def plot_three_loss_curves(epoch_list,
+                                   base_losses, tv_losses, per_losses,
+                                   save_path):
+            plt.figure(figsize=(12, 4))
+
+            plt.subplot(1, 3, 1)
+            plt.plot(epoch_list, base_losses, marker='o', label='Base Loss')
+            plt.xlabel('Epoch')
+            plt.ylabel('Loss')
+            plt.title('Base Loss')
+            plt.grid(True)
+            plt.legend()
+
+            plt.subplot(1, 3, 2)
+            plt.plot(epoch_list, tv_losses, marker='s', label='TV Loss', color='g')
+            plt.xlabel('Epoch')
+            plt.ylabel('Loss')
+            plt.title('TV Loss')
+            plt.grid(True)
+            plt.legend()
+
+            plt.subplot(1, 3, 3)
+            plt.plot(epoch_list, per_losses, marker='^', label='Perceptual Loss', color='r')
+            plt.xlabel('Epoch')
+            plt.ylabel('Loss')
+            plt.title('Perceptual Loss')
+            plt.grid(True)
+            plt.legend()
+
+            plt.tight_layout()
+            plt.savefig(save_path)
+            plt.close()
+            print(f"[INFO] Loss curves saved to {save_path}")
+
         def plot_progress(epoch,
                           train_losses, train_psnrs, train_ssims,
                           val_losses, val_psnrs, val_ssims):
@@ -453,7 +606,7 @@ class Trainer(object):
             plt.legend()
 
             plt.tight_layout()
-            save_dir = os.path.join(self.img_save_dir, 'invSigmak_mse_batch=8_segUnet_lr=0.005_numworkers2_init=10')
+            save_dir = os.path.join(self.img_save_dir, 'mse+tv+per_train840x10x4_val_split0.2_batch=8_lr=0.005_numworkers4_init=10M3FD_snr45_tv1e-4_per1e-3')
             os.makedirs(save_dir, exist_ok=True)
             save_path = os.path.join(save_dir, f"progress_epoch_{epoch}.png")
             plt.savefig(save_path)
@@ -476,11 +629,9 @@ class Trainer(object):
         for epoch in range(self.epochs):
             model.train()
             train_loss = 0
-            val_loss = 0
             train_psnr, train_ssim = 0, 0
-            val_psnr, val_ssim = 0, 0
             count = 0
-
+            self.loss_meter.reset()
             # Training
             # for iter_num, data in enumerate(test_loader):
             loop = tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Epoch {epoch + 1}/{self.epochs}")
@@ -490,10 +641,12 @@ class Trainer(object):
 
                 # 本批统一 kernel
                 kid_val = random.randint(0, 9)
+                # kid_val = int(idxs[0].item() % 10)
                 # 批量取 LR/Aty
                 lr_list, Aty_list = [], []
                 for i in idxs.tolist():
-                    lr_i, Aty_i = dataset.get_item_with_kid(int(i), kid_val)
+                    lr_i, Aty_i = train_dataset.dataset.get_item_with_kid(int(i), kid_val, snr=45)
+                    # lr_i, Aty_i = train_dataset.dataset.get_item_with_kid(i, kid_val, snr=35)
                     lr_list.append(lr_i)
                     Aty_list.append(Aty_i)
                 y = torch.stack(lr_list, dim=0).to(self.device, non_blocking=True)  # [B,1,h,w]
@@ -522,7 +675,7 @@ class Trainer(object):
                     train_ssim += ssim_train
                     count += 1
                 if iter_num == 0:
-                    self._save_reconstructed_image(recon, x_true, y, epoch, iter_num)
+                    self._save_train_reconstructed_image(recon, x_true, y, epoch, iter_num)
 
                 loss = loss_func(output[2], x_true)
                 # print('\n Loss Epoch {} : {:.4f}\n'.format(epoch, loss))
@@ -538,7 +691,12 @@ class Trainer(object):
                     optimizer.step()
                     optimizer.zero_grad()
             scheduler.step()
-
+            mean_base, mean_tv, mean_per = self.loss_meter.report()
+            train_base_losses.append(mean_base)
+            train_tv_losses.append(mean_tv)
+            train_per_losses.append(mean_per)
+            print(f"[Epoch {epoch}] MeanLoss: base={mean_base:.6f}, tv={mean_tv:.6f}, per={mean_per:.6f}")
+            # print(f"[Epoch {epoch}] MeanLoss: base={mean_base:.6f}, per={mean_per:.6f}")
             avg_train_loss = train_loss / len(train_loader)
             avg_train_psnr = train_psnr / count
             avg_train_ssim = train_ssim / count
@@ -552,14 +710,22 @@ class Trainer(object):
             val_count = 0
 
             with torch.no_grad():
-                for x_true, idxs in val_loader:
+                val_loop = tqdm(enumerate(val_loader),
+                                total=len(val_loader),
+                                desc=f"Valid {epoch + 1}/{self.epochs}")
+                original_to_subset_idx = {real_idx: subset_idx for subset_idx, real_idx in
+                                          enumerate(val_dataset.indices)}
+                # for x_true, idxs in val_loader:
+                # for iter_num, (x_true, idxs) in enumerate(val_loader):
+                for iter_num, (x_true, idxs) in val_loop:
                     x_true = x_true.to(self.device, non_blocking=True)
-
-                    # 选 kernel 同训练逻辑保持一致
                     kid_val = random.randint(0, 9)
                     lr_list, Aty_list = [], []
-                    for i in idxs.tolist():
-                        lr_i, Aty_i = dataset.get_item_with_kid(int(i), kid_val)
+
+                    for j in idxs.tolist():
+                        # lr_i, Aty_i = val_dataset.dataset.get_item_with_kid(int(i), kid=kid_val)
+                        subset_idx = original_to_subset_idx[j]
+                        lr_i, Aty_i = val_dataset.get_item_with_kid(subset_idx, kid=kid_val, snr=45)
                         lr_list.append(lr_i)
                         Aty_list.append(Aty_i)
 
@@ -588,6 +754,14 @@ class Trainer(object):
                         val_psnr += psnr_val
                         val_ssim += ssim_val
                         val_count += 1
+                    val_loop.set_postfix({
+                        "Val Loss": f"{v_loss.item():.4f}",
+                        "Last PSNR": f"{psnr_val:.2f}dB",
+                        "Last SSIM": f"{ssim_val:.4f}"
+                    })
+
+                    if iter_num == 0:
+                        self._save_val_reconstructed_image(recon, x_true, y, epoch, iter_num)
 
             avg_val_loss = val_loss / len(val_loader)
             avg_val_psnr = val_psnr / val_count
@@ -606,10 +780,20 @@ class Trainer(object):
             print(
                 f'Epoch {epoch}: Train Loss={avg_train_loss:.4f}, Train PSNR={avg_train_psnr:.2f}, Train SSIM={avg_train_ssim:.4f}')
             print(f'[VAL] Loss={avg_val_loss:.4f} PSNR={avg_val_psnr:.2f} SSIM={avg_val_ssim:.4f}\n')
-            self.save_model()
-            plot_progress(epoch + 1,
+            self.save_model(model=model)
+            epoch_list = list(range(1, len(train_base_losses) + 1))
+            plot_progress(epoch,
                           train_losses, train_psnrs, train_ssims,
                           val_losses, val_psnrs, val_ssims)
+            save_dir = os.path.join(self.img_save_dir,
+                                    'mse+tv+per_train840x10x4_val_split0.2_batch=8_lr=0.005_numworkers4_init=10M3FD_snr45_tv1e-4_per1e-3')
+            os.makedirs(save_dir, exist_ok=True)
+            save_path = os.path.join(save_dir, "train_loss_components.png")
+            plot_three_loss_curves(epoch_list,
+                                   train_base_losses,
+                                   train_tv_losses,
+                                   train_per_losses,
+                                   save_path)
 
         # torch.save(model.state_dict(), './output/final.ckpt')
                 # pred = output.argmax(dim=1, keepdim=True)
@@ -679,8 +863,8 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     args= Args(device=device, moddir="./models", outdir='./outputs',
                 logdir='./logs', imgdir='./images', resdir='./results', initdir='./inits',
-                num_classes=2, model='UnrollVBA', lr=0.001, optimizer='adam',
-                dataset='infrared', batch_size=8, epochs=100, train_size=1.0,
+                num_classes=2, model='UnrollVBA', lr=0.005, optimizer='adam',
+                dataset='infrared', batch_size=8, epochs=200, train_size=1.0,
                 num_workers=4, loss='mse+tv+per', log_interval=8)
     # args = get_arguments()
     # 数据集路径
